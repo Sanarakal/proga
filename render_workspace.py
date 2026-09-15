@@ -1,0 +1,107 @@
+import os
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+import tempfile
+from pathlib import Path
+from PySide6.QtWidgets import QApplication, QPushButton
+from workspace_ui import Window, ForwardDialog, SourceMembersDialog, CollectAccountsDialog, BatchReportDialog, configure_app, apply_theme
+from workspace_store import Store
+
+
+app = QApplication([])
+configure_app(app)
+with tempfile.TemporaryDirectory() as directory:
+    store = Store(directory)
+    account = store.add_account('Рабочий аккаунт')
+    store.execute('UPDATE accounts SET max_id=? WHERE id=?', (10001, account))
+    for uid, name in [(110, 'Александр'), (111, 'Елена'), (112, 'Дмитрий'), (113, 'Мария')]:
+        store.contact(account, uid, name, 'Группа команды')
+    for uid, name in [(-100, 'Группа команды'), (-101, 'Общий чат участников')]:
+        store.execute('INSERT INTO chats VALUES(?,?,?,?)', (account, uid, name, 'CHAT'))
+    job = store.new_job(account, 'collect', -100, 10, [110, 111, 112, 113])
+    store.item(job, 110, 'confirmed')
+    store.item(job, 111, 'confirmed')
+    store.update_source(-100, 'Группа команды', 1756)
+    store.confirm_harvest(-100, 110, account, job)
+    store.confirm_harvest(-100, 111, account, job)
+    store.status(job, 'paused', 'Подтверждено 2 / 10. Приостановлено пользователем.')
+    store.log(account, 'Аккаунт подключён')
+    window = Window(store, demo=True)
+    window.show()
+    output = Path(__file__).parent / 'preview'
+    output.mkdir(exist_ok=True)
+    for width, height in [(1180, 780), (920, 640)]:
+        window.resize(width, height)
+        for page in range(8):
+            window.nav.setCurrentRow(page)
+            app.processEvents()
+            image = window.grab()
+            image.save(str(output / f'page-{page}-{width}.png'))
+            assert window.pages.width() > 600
+            for button in window.pages.currentWidget().findChildren(QPushButton):
+                if button.isVisible():
+                    needed = button.fontMetrics().horizontalAdvance(button.text()) + 32 + (24 if not button.icon().isNull() else 0)
+                    assert button.width() >= needed, (button.text(), button.width(), needed)
+    window.engine.loop.call_soon_threadsafe(window.engine.loop.stop)
+    window.engine.thread.join(5)
+    window.timer.stop()
+    window.hide()
+    dialog = ForwardDialog(
+        [(7001, 'Проверочное сообщение с текстом', 1_700_000_000_000),
+         (7002, 'Сообщение с вложением', 1_700_000_100_000)],
+        [{'uid': -100, 'name': 'Группа команды', 'kind': 'Группа'},
+         {'uid': -101, 'name': 'Общий чат участников', 'kind': 'Группа'}],
+        [('Рабочая папка', [-100, -101])], None)
+    dialog.show()
+    app.processEvents()
+    dialog.grab().save(str(output / 'forward-dialog.png'))
+    dialog.close()
+    source = store.source_rows()[0]
+    source_dialog = SourceMembersDialog(source, store.source_members(source['chat']), None)
+    source_dialog.show()
+    app.processEvents()
+    source_dialog.grab().save(str(output / 'source-members-dialog.png'))
+    source_dialog.close()
+    second = store.add_account('Второй аккаунт')
+    store.execute('INSERT INTO chats VALUES(?,?,?,?)', (second, -200, 'Другая группа', 'CHAT'))
+    store.set_setting('collect_source_' + account, -100)
+    store.set_setting('collect_source_' + second, -200)
+    collect = CollectAccountsDialog(store, store.rows('SELECT * FROM accounts'))
+    store.save_template('Ежедневный сбор', 20, [(account, -100), (second, -200)])
+    collect.reload_templates('Ежедневный сбор')
+    collect.select_all(True)
+    collect.favorite_selected(True)
+    collect.consent.setChecked(True)
+    collect.show()
+    for width in (780, 640):
+        collect.resize(width, 520)
+        app.processEvents()
+        collect.grab().save(str(output / f'collect-{width}.png'))
+    collect.close()
+    store.set_job_options(job, {'group': 'demo'})
+    second_job = store.new_job(second, 'collect', -200, 10, [301, 302], {'group': 'demo'})
+    store.item(second_job, 301, 'confirmed')
+    store.item(second_job, 302, 'pending')
+    store.update_source(-200, 'Другая группа', 800)
+    batch = BatchReportDialog(store.batch_report(job))
+    batch.show()
+    app.processEvents()
+    batch.grab().save(str(output / 'batch-light.png'))
+    batch.close()
+    window.theme.setCurrentIndex(window.theme.findData('dark'))
+    window.show()
+    for width, height in ((1180, 780), (920, 640)):
+        window.resize(width, height)
+        for page in range(8):
+            window.nav.setCurrentRow(page)
+            app.processEvents()
+            window.grab().save(str(output / f'dark-{page}-{width}.png'))
+    window.hide()
+    collect.show()
+    app.processEvents()
+    collect.grab().save(str(output / 'collect-dark.png'))
+    collect.close()
+    batch.show()
+    app.processEvents()
+    batch.grab().save(str(output / 'batch-dark.png'))
+    batch.close()
+print('Rendered all eight pages at desktop and minimum window sizes')

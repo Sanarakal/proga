@@ -1,0 +1,44 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated builds and visual checks
+/build/
+/dist/
+/preview/
+*.egg-info/
+
+# Upstream checkout; dependency is pinned in requirements-workspace.txt
+/vendor/
+
+# Local account data and credentials
+.env
+.env.*
+!.env.example
+sessions/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.protected
+*.protected.*
+*.lock
+*.log
+*.pem
+*.key
+
+# Local exports and editor state
+*.csv
+*.tsv
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
