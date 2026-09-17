@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from workspace_store import Store
 from workspace_security import crypt, Vault
@@ -148,6 +148,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             add_contact=AsyncMock(side_effect=lambda uid: user(uid)),
             invite_users_to_group=AsyncMock(), forward_message=AsyncMock(return_value=SimpleNamespace(id=88)))
         self.engine.clients[self.account] = self.client
+        self.store.account_status(self.account, 'online')
         async def direct(account, operation, *args, **kwargs):
             return await operation(*args, **kwargs)
         self.engine.request = direct
@@ -176,6 +177,71 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         await self.engine.run_job(job)
         self.client.get_chat_members.assert_not_awaited()
 
+    async def test_repeated_collection_reuses_remaining_page(self):
+        self.client.get_chat_members.return_value = (members(3, 4, 5, 6), 0)
+        jobs = [self.store.new_job(self.account, 'collect', -1, 2, [], {'refill': True}) for _ in range(2)]
+        for job in jobs:
+            await self.engine.run_job(job)
+        self.client.get_chat_members.assert_awaited_once()
+        self.assertEqual(self.store.harvested_ids(), {3, 4, 5, 6})
+        metrics = self.store.rows('SELECT * FROM job_metrics WHERE job=?', (jobs[1],))[0]
+        self.assertEqual(metrics['cached_pages'], 1)
+        self.assertGreater(metrics['elapsed'], 0)
+
+    async def test_read_does_not_wait_for_write_interval(self):
+        import time
+        self.engine.last_request[(self.account, 'write')] = time.monotonic()
+        async def get_chat():
+            return 'cached-result'
+        async def add_contact():
+            return 'added'
+        with patch('workspace_engine.asyncio.sleep', new_callable=AsyncMock) as sleep:
+            await Engine.request(self.engine, self.account, get_chat)
+            sleep.assert_not_awaited()
+            await Engine.request(self.engine, self.account, add_contact)
+            sleep.assert_awaited_once()
+            self.assertGreater(sleep.await_args.args[0], 1)
+
+    async def test_confirmation_rolls_back_as_one_transaction(self):
+        import sqlite3
+        job_id = self.store.new_job(self.account, 'collect', -1, 1, [3])
+        self.store.item(job_id, 3, 'pending', attempted=True)
+        self.store.claim_harvest(-1, 3, self.account, job_id)
+        self.store.execute("CREATE TRIGGER fail_harvest BEFORE INSERT ON harvested BEGIN SELECT RAISE(ABORT, 'test'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.confirm_collection(self.store.job(job_id), 3, 'Contact', '', 1)
+        self.assertEqual(self.store.items(job_id)[3], 'pending')
+        self.assertFalse(self.store.contacts(self.account))
+        self.assertTrue(self.store.rows('SELECT * FROM harvest_claims'))
+
+    async def test_expired_source_cache_is_refetched(self):
+        self.store.save_source_page(self.account, -1, None, [(3, 'Old', False)], 0)
+        self.store.execute('UPDATE source_pages SET created=0')
+        self.client.get_chat_members.return_value = (members(4), 0)
+        preview = await self.engine.preview(self.account, 'collect', -1, 1)
+        self.assertEqual([uid for uid, _ in preview['candidates']], [4])
+        self.client.get_chat_members.assert_awaited_once()
+
+    async def test_source_cache_is_account_scoped(self):
+        other = self.store.add_account('Other')
+        self.store.save_source_page(other, -1, None, [(3, 'Private', False)], 0)
+        self.client.get_chat_members.return_value = (members(4), 0)
+        preview = await self.engine.preview(self.account, 'collect', -1, 1)
+        self.assertEqual([uid for uid, _ in preview['candidates']], [4])
+
+    async def test_invalid_marker_restarts_source_once(self):
+        self.store.save_source_page(self.account, -1, None, [(1, 'Self', False)], 55)
+        self.client.get_chat_members.side_effect = [ApiError(opcode=59, error='invalid.marker'), (members(4), 0)]
+        preview = await self.engine.preview(self.account, 'collect', -1, 1)
+        self.assertEqual([uid for uid, _ in preview['candidates']], [4])
+        self.assertEqual(self.client.get_chat_members.await_count, 2)
+
+    async def test_quota_at_page_boundary_does_not_fetch_next_page(self):
+        self.client.get_chat_members.return_value = (members(3, 4), 55)
+        job = self.store.new_job(self.account, 'collect', -1, 2, [], {'refill': True})
+        await self.engine.run_job(job)
+        self.client.get_chat_members.assert_awaited_once()
+
     async def test_refill_replaces_blocked_and_preserves_plan(self):
         self.client.add_contact.side_effect = [ApiError(opcode=34, error='user.blocked'), user(4), user(5)]
         self.client.get_chat_members.return_value = (members(3, 4, 5), 0)
@@ -191,6 +257,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             get_chat=self.client.get_chat, get_chat_members=AsyncMock(return_value=(members(3, 4, 5, 6), 0)),
             add_contact=AsyncMock(side_effect=lambda uid: user(uid)))
         self.engine.clients[second] = other
+        self.store.account_status(second, 'online')
         self.client.get_chat_members.return_value = (members(3, 4, 5, 6), 0)
         jobs = [self.store.new_job(a, 'collect', -1, 2, [], {'refill': True}) for a in (self.account, second)]
         await asyncio.gather(*(self.engine.run_job(j) for j in jobs))
@@ -299,6 +366,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 type='CHAT', title='Source group', participants_count=3)),
             get_chat_members=AsyncMock(return_value=(members(3, 4, 10), 0)))
         self.engine.clients[other] = other_client
+        self.store.account_status(other, 'online')
         preview = await self.engine.preview(other, 'collect', -1, 1)
         self.assertEqual([uid for uid, _ in preview['candidates']], [4])
         source = self.store.source_rows()[0]

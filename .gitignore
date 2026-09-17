@@ -1,5 +1,6 @@
 # Python environments and caches
 .venv/
+.venv-*/
 venv/
 __pycache__/
 *.py[cod]
@@ -34,6 +35,9 @@ sessions/
 *.log
 *.pem
 *.key
+*.maxbackup
+*.recovery-key
+/transfer-*/
 
 # Local exports and editor state
 *.csv

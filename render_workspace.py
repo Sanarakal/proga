@@ -2,9 +2,12 @@ import os
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from PySide6.QtWidgets import QApplication, QPushButton
-from workspace_ui import Window, ForwardDialog, SourceMembersDialog, CollectAccountsDialog, BatchReportDialog, configure_app, apply_theme
+from workspace_ui import Window, ForwardDialog, SourceMembersDialog, CollectAccountsDialog, BatchReportDialog, JoinLinksDialog, ChatCatalogDialog, configure_app, apply_theme
+from workspace_links import LinkImport
 from workspace_store import Store
+from workspace_ui import ConnectDialog, LoginInputDialog
 
 
 app = QApplication([])
@@ -25,13 +28,35 @@ with tempfile.TemporaryDirectory() as directory:
     store.confirm_harvest(-100, 111, account, job)
     store.status(job, 'paused', 'Подтверждено 2 / 10. Приостановлено пользователем.')
     store.log(account, 'Аккаунт подключён')
+    join_entries = [dict(title='Рабочая группа', link='https://max.ru/join/demo-one', source='Лист1!6'),
+                    dict(title='Обсуждения участников', link='https://max.ru/join/demo-two', source='Лист1!7')]
+    store.save_join_file('Чаты.xlsx', b'demo', LinkImport(entries=join_entries + [dict(title='Свободная группа', link='https://max.ru/join/demo-three', source='8')]))
+    join_job = store.new_join_job(account, join_entries, 2)
+    store.item(join_job, 1, 'confirmed', 'MAX подтвердил участие')
+    store.item(join_job, 2, 'unavailable', 'Ссылка истекла')
+    store.status(join_job, 'complete', 'Вступил: 1 из 2')
     window = Window(store, demo=True)
     window.show()
     output = Path(__file__).parent / 'preview'
     output.mkdir(exist_ok=True)
+    for theme in ('light', 'dark'):
+        apply_theme(app, theme)
+        login = ConnectDialog('Рабочий аккаунт', saved=True)
+        login.method.setCurrentIndex(login.method.findData('phone'))
+        login.show()
+        app.processEvents()
+        login.grab().save(str(output / f'login-{theme}.png'))
+        login.close()
+        for kind in ('code', 'password'):
+            prompt = LoginInputDialog(kind, '+7 *** *** 4567', 'Рабочий аккаунт')
+            prompt.show()
+            app.processEvents()
+            prompt.grab().save(str(output / f'login-{kind}-{theme}.png'))
+            prompt.close()
+    apply_theme(app, 'light')
     for width, height in [(1180, 780), (920, 640)]:
         window.resize(width, height)
-        for page in range(8):
+        for page in range(len(window.names)):
             window.nav.setCurrentRow(page)
             app.processEvents()
             image = window.grab()
@@ -45,6 +70,23 @@ with tempfile.TemporaryDirectory() as directory:
     window.engine.thread.join(5)
     window.timer.stop()
     window.hide()
+    store.invalidate_catalog_link(join_entries[1]['link'], 'Ссылка истекла')
+    catalog = ChatCatalogDialog(store)
+    catalog.show()
+    for width, height in ((1000, 680), (700, 540)):
+        catalog.resize(width, height)
+        app.processEvents()
+        catalog.grab().save(str(output / f'catalog-light-{width}.png'))
+    catalog.hide()
+    join_dialog = JoinLinksDialog(store.rows('SELECT * FROM accounts'), store=store)
+    join_dialog.select_all(True)
+    join_dialog.consent.setChecked(True)
+    join_dialog.show()
+    for width, height in ((800, 660), (640, 580)):
+        join_dialog.resize(width, height)
+        app.processEvents()
+        join_dialog.grab().save(str(output / f'join-light-{width}.png'))
+    join_dialog.hide()
     dialog = ForwardDialog(
         [(7001, 'Проверочное сообщение с текстом', 1_700_000_000_000),
          (7002, 'Сообщение с вложением', 1_700_000_100_000)],
@@ -87,15 +129,47 @@ with tempfile.TemporaryDirectory() as directory:
     app.processEvents()
     batch.grab().save(str(output / 'batch-light.png'))
     batch.close()
+    for title, state, reason in [('Основной', 'online', 'Вход в MAX подтверждён.'),
+                                  ('Резервный', 'needs_login', 'MAX завершил сессию. Подключите аккаунт заново.'),
+                                  ('Рабочий 2', 'limited', 'MAX ограничил запросы.'),
+                                  ('Рабочий 3', 'blocked', 'MAX сообщил о блокировке аккаунта.')]:
+        identity = store.add_account(title)
+        store.account_status(identity, state, reason, checked=True)
+        if state == 'online':
+            window.engine.clients[identity] = SimpleNamespace(is_connected=True)
+    window.reload_accounts()
+    window.nav.setCurrentRow(0)
+    window.show()
+    for theme in ('light', 'dark'):
+        store.set_setting('theme', theme)
+        apply_theme(app, theme)
+        for width, height in ((1180, 780), (920, 640)):
+            window.resize(width, height)
+            window.refresh()
+            app.processEvents()
+            window.grab().save(str(output / f'accounts-status-{theme}-{width}.png'))
+    window.hide()
     window.theme.setCurrentIndex(window.theme.findData('dark'))
     window.show()
     for width, height in ((1180, 780), (920, 640)):
         window.resize(width, height)
-        for page in range(8):
+        for page in range(len(window.names)):
             window.nav.setCurrentRow(page)
             app.processEvents()
             window.grab().save(str(output / f'dark-{page}-{width}.png'))
     window.hide()
+    join_dialog.show()
+    for width, height in ((800, 660), (640, 580)):
+        join_dialog.resize(width, height)
+        app.processEvents()
+        join_dialog.grab().save(str(output / f'join-dark-{width}.png'))
+    join_dialog.close()
+    catalog.show()
+    for width, height in ((1000, 680), (700, 540)):
+        catalog.resize(width, height)
+        app.processEvents()
+        catalog.grab().save(str(output / f'catalog-dark-{width}.png'))
+    catalog.close()
     collect.show()
     app.processEvents()
     collect.grab().save(str(output / 'collect-dark.png'))
@@ -104,4 +178,4 @@ with tempfile.TemporaryDirectory() as directory:
     app.processEvents()
     batch.grab().save(str(output / 'batch-dark.png'))
     batch.close()
-print('Rendered all eight pages at desktop and minimum window sizes')
+print('Rendered all pages at desktop and minimum window sizes')

@@ -3,3 +3,5 @@ Pillow==12.3.0
 qrcode==8.2
 maxapi-python==2.4.1
 pyinstaller==6.22.3
+openpyxl==3.1.5
+cryptography==50.0.1

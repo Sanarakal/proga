@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import csv
 import json
 import os
@@ -9,7 +10,7 @@ from pathlib import Path
 from io import BytesIO
 
 import qrcode
-from PySide6.QtCore import Qt, QTimer, QLockFile, QStandardPaths
+from PySide6.QtCore import Qt, QTimer, QLockFile, QStandardPaths, QObject, Signal, QRunnable, QThreadPool
 from PySide6.QtGui import QFont, QPixmap, QDesktopServices, QFontDatabase, QPalette, QColor
 from PySide6.QtCore import QUrl
 from PySide6.QtWidgets import (
@@ -17,11 +18,14 @@ from PySide6.QtWidgets import (
     QPushButton, QListWidget, QStackedWidget, QComboBox, QLineEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QDialog, QDialogButtonBox,
     QSpinBox, QFormLayout, QMessageBox, QInputDialog, QFileDialog, QProgressBar,
-    QCheckBox, QStyle, QGridLayout, QToolButton, QMenu, QCompleter,
+    QCheckBox, QStyle, QGridLayout, QToolButton, QMenu, QCompleter, QStyledItemDelegate,
 )
 
 from workspace_store import Store
 from workspace_engine import Engine
+from workspace_auth import normalize_phone
+from workspace_status import account_display
+from workspace_links import read_links, LINK_STATES, csv_value, LinkImport
 
 
 STATUS = {'queued': 'Готово к запуску', 'running': 'Выполняется', 'paused': 'На паузе',
@@ -131,6 +135,13 @@ QToolTip { background: #303438; color: #edf0f2; border: 1px solid #687279; paddi
 '''
 
 
+class StatusBadgeDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        # Keep searchable item text, but draw it only once in the badge widget.
+        option.text = ''
+
+
 def table(headers):
     widget = QTableWidget(0, len(headers))
     widget.setHorizontalHeaderLabels(headers)
@@ -169,6 +180,89 @@ def message_time(value):
 
 def display_time(value):
     return time.strftime('%d.%m.%Y %H:%M', time.localtime(value)) if value else '—'
+
+
+class ConnectDialog(QDialog):
+    def __init__(self, name, saved=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Вход в MAX / ' + name)
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        self.method = QComboBox()
+        if saved:
+            self.method.addItem('Сохранённая сессия', 'saved')
+        self.method.addItem('QR-код', 'qr')
+        self.method.addItem('Номер телефона', 'phone')
+        layout.addWidget(self.method)
+        self.phone = QLineEdit()
+        self.phone.setPlaceholderText('+7 999 123-45-67')
+        self.phone.setMaxLength(32)
+        self.phone.setAccessibleName('Номер телефона')
+        layout.addWidget(self.phone)
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        layout.addWidget(self.error)
+        warning = QLabel('Неофициальное подключение. Возможны ограничения MAX.')
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        self.buttons = QDialogButtonBox()
+        self.submit_button = self.buttons.addButton('Подключить', QDialogButtonBox.ButtonRole.AcceptRole)
+        self.buttons.addButton('Отмена', QDialogButtonBox.ButtonRole.RejectRole)
+        for button in self.buttons.buttons():
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance('Получить код') + 40)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        self.method.currentIndexChanged.connect(self.update_method)
+        self.update_method()
+
+    def update_method(self):
+        phone = self.method.currentData() == 'phone'
+        self.phone.setVisible(phone)
+        self.submit_button.setText('Получить код' if phone else 'Подключить')
+        self.error.clear()
+        if phone:
+            self.phone.setFocus()
+
+    def accept(self):
+        if self.method.currentData() == 'phone':
+            try:
+                self.phone.setText(normalize_phone(self.phone.text()))
+            except ValueError as error:
+                self.error.setText(str(error))
+                return
+        super().accept()
+
+
+class LoginInputDialog(QDialog):
+    def __init__(self, kind, detail, name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(('Код подтверждения' if kind == 'code' else 'Пароль MAX') + ' / ' + name)
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        label = QLabel('Код для ' + detail if kind == 'code' else 'Пароль двухэтапной проверки')
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.value = QLineEdit()
+        self.value.setEchoMode(QLineEdit.EchoMode.Password)
+        self.value.setAccessibleName('Код подтверждения' if kind == 'code' else 'Пароль')
+        self.value.setMaxLength(10 if kind == 'code' else 256)
+        layout.addWidget(self.value)
+        self.buttons = QDialogButtonBox()
+        self.confirm = self.buttons.addButton('Подтвердить', QDialogButtonBox.ButtonRole.AcceptRole)
+        self.buttons.addButton('Отменить вход', QDialogButtonBox.ButtonRole.RejectRole)
+        for button in self.buttons.buttons():
+            button.setMinimumWidth(button.fontMetrics().horizontalAdvance(button.text()) + 40)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+        def validate():
+            text = self.value.text()
+            self.confirm.setEnabled(bool(text) if kind != 'code' else
+                                    4 <= len(text) <= 10 and text.isascii() and text.isdigit())
+        self.value.textChanged.connect(validate)
+        self.value.returnPressed.connect(lambda: self.accept() if self.confirm.isEnabled() else None)
+        validate()
 
 
 class CollectAccountsDialog(QDialog):
@@ -577,6 +671,278 @@ class ForwardDialog(QDialog):
         return message, targets
 
 
+class LinkFileField(QLineEdit):
+    dropped = Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.setReadOnly(True)
+        self.setAcceptDrops(True)
+        self.setPlaceholderText('Перетащите XLSX, CSV или TXT')
+
+    def dragEnterEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls and all(url.isLocalFile() for url in urls):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls and all(url.isLocalFile() for url in urls):
+            self.dropped.emit([url.toLocalFile() for url in urls])
+            event.acceptProposedAction()
+
+
+class LinkImportSignals(QObject):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+
+class LinkImportWorker(QRunnable):
+    def __init__(self, filenames, store, signals):
+        super().__init__()
+        self.filenames, self.store, self.signals = filenames, store, signals
+
+    def run(self):
+        results = []
+        for filename in self.filenames:
+            try:
+                path = Path(filename)
+                if path.stat().st_size > 30 * 1024 * 1024:
+                    raise ValueError('Файл больше 30 МБ')
+                original = path.read_bytes()
+                imported = read_links(filename)
+                if path.read_bytes() != original:
+                    raise ValueError('Файл изменился во время чтения')
+                results.append(dict(file=path.name, **self.store.save_join_file(filename, original, imported)))
+            except Exception as error:
+                results.append(dict(file=Path(filename).name,
+                                    error=str(error) if isinstance(error, (OSError, ValueError)) else 'Не удалось прочитать файл'))
+        self.signals.loaded.emit(results)
+
+
+class ChatCatalogDialog(QDialog):
+    def __init__(self, store, parent=None):
+        super().__init__(parent)
+        self.store, self.loading = store, False
+        self.setWindowTitle('База чатов')
+        self.resize(1000, 680)
+        self.setMinimumSize(700, 540)
+        layout = QVBoxLayout(self)
+        tools = QHBoxLayout()
+        self.file = LinkFileField()
+        self.file.dropped.connect(self.load_files)
+        self.browse = QPushButton('Добавить файлы')
+        self.browse.clicked.connect(self.choose_files)
+        tools.addWidget(self.file, 1)
+        tools.addWidget(self.browse)
+        layout.addLayout(tools)
+        filters = QHBoxLayout()
+        self.folder = QComboBox()
+        for folder in store.rows('SELECT * FROM chat_folders ORDER BY id'):
+            self.folder.addItem(folder['name'], folder['id'])
+        self.mode = QComboBox()
+        for name, value in (('Все в базе', 'active'), ('Свободные', 'free'),
+                            ('Неактивные ссылки', 'inactive'), ('Объединённые ссылки', 'duplicate')):
+            self.mode.addItem(name, value)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText('Название, ссылка или ID')
+        filters.addWidget(self.folder)
+        filters.addWidget(self.mode)
+        filters.addWidget(self.search, 1)
+        layout.addLayout(filters)
+        self.stats = QLabel()
+        self.stats.setWordWrap(True)
+        layout.addWidget(self.stats)
+        self.result = QLabel('')
+        self.result.setWordWrap(True)
+        self.result.setObjectName('muted')
+        layout.addWidget(self.result)
+        self.chats = table(['Группа', 'Состояние', 'Аккаунт', 'Ссылка'])
+        layout.addWidget(self.chats, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText('Закрыть')
+        details = buttons.addButton('Подробности', QDialogButtonBox.ButtonRole.ActionRole)
+        details.clicked.connect(self.details)
+        self.start = buttons.addButton('Вступить', QDialogButtonBox.ButtonRole.AcceptRole)
+        self.start.setObjectName('primary')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.signals = LinkImportSignals()
+        self.signals.loaded.connect(self.imported)
+        self.folder.currentIndexChanged.connect(self.refresh)
+        self.mode.currentIndexChanged.connect(self.refresh)
+        self.search_timer = QTimer(self)
+        self.search_timer.setSingleShot(True)
+        self.search_timer.timeout.connect(self.refresh)
+        self.search.textChanged.connect(lambda: self.search_timer.start(150))
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.finished.connect(self.timer.stop)
+        self.finished.connect(self.search_timer.stop)
+        self.refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.timer.start(1500)
+
+    def hideEvent(self, event):
+        self.timer.stop()
+        self.search_timer.stop()
+        super().hideEvent(event)
+
+    def refresh(self):
+        folder, mode = self.folder.currentData(), self.mode.currentData()
+        counts = self.store.catalog_counts(folder)
+        self.stats.setText(f'В базе: {counts.get("active", 0)} · Свободно: {counts["free"]} · '
+                           f'Неактивных: {counts.get("inactive", 0)} · Объединено: {counts.get("duplicate", 0)}')
+        self.rows = self.store.catalog_rows(folder, 'active' if mode == 'free' else mode,
+                                             self.search.text(), only_free=mode == 'free')
+        labels = dict(confirmed='Вступил', skipped='Уже состоит', pending='Не подтверждено', reserved='Закреплён')
+        fill(self.chats, [(r['link'], [r['title'], 'Неактивна' if r['state'] == 'inactive' else
+              'Объединена' if r['state'] == 'duplicate' else labels.get(r['taken'], 'Свободен'),
+              r['account_name'], r['link']]) for r in self.rows])
+        self.start.setEnabled(bool(counts['free'] and not self.loading))
+        self.chats.setToolTip('Показано до 1000 результатов. Поиск выполняется по всей базе.')
+
+    def choose_files(self):
+        filenames, _ = QFileDialog.getOpenFileNames(self, 'Добавить в базу', '', 'Списки групп (*.xlsx *.csv *.txt)')
+        if filenames:
+            self.load_files(filenames)
+
+    def load_files(self, filenames):
+        if self.loading or not filenames:
+            return
+        self.loading = True
+        self.browse.setEnabled(False)
+        self.file.setText(f'Импорт файлов: {len(filenames)}')
+        self.result.setText('Импорт...')
+        self.refresh()
+        QThreadPool.globalInstance().start(LinkImportWorker(filenames, self.store, self.signals))
+
+    def imported(self, results):
+        self.loading = False
+        self.browse.setEnabled(True)
+        self.file.clear()
+        good = [r for r in results if 'error' not in r]
+        self.result.setText(f'Добавлено: {sum(r["added"] for r in good)} · Уже в базе: {sum(r["existing"] for r in good)} · '
+                            f'Неверный формат: {sum(r["invalid"] for r in good)} · Повторы в файлах: {sum(r["duplicates"] for r in good)}')
+        errors = [r['file'] + ': ' + r['error'] for r in results if 'error' in r]
+        if errors:
+            self.result.setText(self.result.text() + f' · Ошибок файлов: {len(errors)}')
+            QMessageBox.warning(self, 'Импорт файлов', '\n'.join(errors[:10]))
+        self.refresh()
+
+    def details(self):
+        selected = self.chats.selectionModel().selectedRows()
+        if len(selected) != 1:
+            return
+        link = self.chats.item(selected[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+        row = next(r for r in self.rows if r['link'] == link)
+        QMessageBox.information(self, 'Чат', '\n'.join([
+            row['title'], row['link'], f'ID: {row["chat"] or "ещё не определён"}',
+            f'Источник: {row["import_name"]}', f'Аккаунт: {row["account_name"] or "не закреплён"}', row['reason'],
+        ]))
+
+
+class JoinLinksDialog(QDialog):
+    def __init__(self, accounts, parent=None, store=None, folder='all'):
+        super().__init__(parent)
+        self.store = store or getattr(parent, 'store', None)
+        self.setWindowTitle('Вступление из базы чатов')
+        self.resize(800, 660)
+        self.setMinimumSize(640, 580)
+        self.imported = None
+        self.loading = False
+        layout = QVBoxLayout(self)
+        self.folder = QComboBox()
+        if self.store:
+            for row in self.store.rows('SELECT * FROM chat_folders ORDER BY id'):
+                self.folder.addItem(row['name'], row['id'])
+            self.folder.setCurrentIndex(max(0, self.folder.findData(folder)))
+        layout.addWidget(self.folder)
+        self.summary = QLabel('Нет свободных чатов')
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.preview = table(['Группа', 'Ссылка', 'Источник', 'Состояние'])
+        self.preview.verticalHeader().setDefaultSectionSize(32)
+        layout.addWidget(self.preview, 1)
+        select_row = QHBoxLayout()
+        select_row.addWidget(QLabel('Аккаунты'))
+        select_row.addStretch()
+        for label, checked in (('Выбрать все', True), ('Снять выбор', False)):
+            button = QPushButton(label)
+            button.clicked.connect(lambda _=False, checked=checked: self.select_all(checked))
+            select_row.addWidget(button)
+        layout.addLayout(select_row)
+        self.accounts = table(['Аккаунт'])
+        self.accounts.setMinimumHeight(90)
+        self.accounts.setMaximumHeight(150)
+        self.accounts.horizontalHeader().hide()
+        self.accounts.setRowCount(len(accounts))
+        self.checks = []
+        for index, account in enumerate(accounts):
+            check = QCheckBox(account['name'])
+            check.setChecked(len(accounts) == 1)
+            check.toggled.connect(self.update_ready)
+            self.accounts.setCellWidget(index, 0, check)
+            self.checks.append((account['id'], check))
+        layout.addWidget(self.accounts)
+        form = QFormLayout()
+        self.amount = QSpinBox()
+        self.amount.setRange(1, 1000)
+        self.amount.setValue(10)
+        form.addRow('Новых групп на каждый аккаунт', self.amount)
+        layout.addLayout(form)
+        self.consent = QCheckBox('Подтверждаю вступления для выбранных аккаунтов')
+        self.consent.toggled.connect(self.update_ready)
+        layout.addWidget(self.consent)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText('Отмена')
+        self.start = buttons.addButton('Начать вступление', QDialogButtonBox.ButtonRole.AcceptRole)
+        self.start.setObjectName('primary')
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.folder.currentIndexChanged.connect(self.reload_catalog)
+        self.reload_catalog()
+        self.update_ready()
+
+    def chosen(self):
+        return [account for account, check in self.checks if check.isChecked()]
+
+    def select_all(self, enabled):
+        for _, check in self.checks:
+            check.setChecked(enabled)
+
+    def update_ready(self):
+        if hasattr(self, 'start'):
+            self.start.setEnabled(bool(not self.loading and self.imported and self.imported.entries
+                                       and self.chosen() and self.consent.isChecked()))
+
+    def reload_catalog(self):
+        self.consent.setChecked(False)
+        if self.store:
+            entries = [dict(link=r['link'], title=r['title'], source=r['import_name']) for r in
+                       self.store.catalog_rows(self.folder.currentData(), limit=-1, only_free=True)]
+            self.loaded(LinkImport(entries=entries))
+
+    def loaded(self, result):
+        self.loading, self.imported = False, result
+        self.summary.setText(f'Свободных ссылок: {len(result.entries)} · Предпросмотр: первые 200')
+        entries = [(i, [r['title'], r['link'], r['source'], 'Свободен'])
+                   for i, r in enumerate(result.entries[:200])]
+        entries += [(f'invalid-{i}', ['', r['link'], r['source'], 'Пропуск'])
+                    for i, r in enumerate(result.invalid[:max(0, 200 - len(entries))])]
+        fill(self.preview, entries)
+        self.update_ready()
+
+    def failed(self, message):
+        self.loading, self.imported = False, None
+        self.summary.setText(message)
+        self.update_ready()
+
+
 class Window(QMainWindow):
     def __init__(self, store, demo=False):
         super().__init__()
@@ -587,7 +953,7 @@ class Window(QMainWindow):
         self.engine.event.connect(self.on_engine_event)
         self.qr_dialogs = {}
         self.closing = False
-        self.setWindowTitle('MAX Workspace — 1.3')
+        self.setWindowTitle('MAX Workspace — 1.8')
         self.resize(1180, 780)
         self.setMinimumSize(920, 640)
         outer = QWidget()
@@ -605,10 +971,10 @@ class Window(QMainWindow):
         side.addWidget(brand)
         side.addSpacing(25)
         self.nav = QListWidget()
-        self.names = ['Аккаунты', 'Чаты', 'Источники', 'Контакты', 'Задания', 'Пересылка', 'Журнал', 'Настройки']
+        self.names = ['Аккаунты', 'Чаты', 'Источники', 'Контакты', 'Задания', 'Пересылка', 'Вступления', 'Журнал', 'Настройки']
         self.nav.addItems(self.names)
         side.addWidget(self.nav, 1)
-        version = QLabel('Windows / версия 1.3')
+        version = QLabel('Windows / версия 1.8')
         version.setObjectName('muted')
         side.addWidget(version)
         shell.addWidget(sidebar)
@@ -632,13 +998,19 @@ class Window(QMainWindow):
         main.addWidget(self.notice)
         self.pages = QStackedWidget()
         main.addWidget(self.pages, 1)
-        self.accounts = self.make_page(['Аккаунт', 'ID MAX', 'Подключение', 'Ограничения'], [
+        self.accounts = self.make_page(['Аккаунт', 'ID MAX', 'Статус', 'Подробности'], [
             ('Добавить', self.add_account, QStyle.StandardPixmap.SP_FileDialogNewFolder),
             ('Подключить', self.connect_account, QStyle.StandardPixmap.SP_DialogApplyButton),
+            ('Проверить статус', self.check_account_status, None),
             ('Отключить', self.disconnect_account, QStyle.StandardPixmap.SP_DialogCancelButton),
             ('Переименовать', self.rename_account, None),
             ('Удалить выбранный аккаунт', self.remove_account, QStyle.StandardPixmap.SP_TrashIcon),
         ])
+        self.accounts.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.accounts.setColumnWidth(1, 100)
+        self.accounts.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.accounts.setColumnWidth(2, 176)
+        self.accounts.setItemDelegateForColumn(2, StatusBadgeDelegate(self.accounts))
         self.accounts.cellClicked.connect(lambda row, column: self.account_selector.setCurrentIndex(self.account_selector.findData(self.accounts.item(row, 0).data(Qt.ItemDataRole.UserRole))))
         self.chats = self.make_page(['Название чата', 'Тип', 'ID MAX'], [
             ('Обновить', self.refresh_chats, QStyle.StandardPixmap.SP_BrowserReload),
@@ -674,6 +1046,21 @@ class Window(QMainWindow):
         self.forward = self.make_page(['Исходный чат', 'Тип', 'ID MAX'], [
             ('Новое задание', self.prepare_forward, QStyle.StandardPixmap.SP_ArrowForward),
         ])
+        self.joins = self.make_page(['Дата', 'Группа', 'Результат', 'Ссылка'], [
+            ('База чатов', self.open_catalog, None),
+            ('Новое задание', self.prepare_join, None),
+            ('Подробности', self.join_details, None),
+            ('CSV', self.export_join_history, None),
+        ])
+        self.join_state = QComboBox()
+        self.join_state.addItem('Все результаты', '')
+        for state, title in LINK_STATES.items():
+            if state != 'queued':
+                self.join_state.addItem(title, state)
+        self.joins.parentWidget().layout().insertWidget(1, self.join_state)
+        self.join_state.currentIndexChanged.connect(self.refresh_join_history)
+        self.joins.property('filter').setPlaceholderText('Поиск в истории аккаунта · последние 1000 результатов')
+        self.joins.property('filter').textChanged.connect(self.refresh_join_history)
         self.logs = self.make_page(['Время', 'Аккаунт', 'Сообщение'], [
             ('CSV', lambda: self.export(self.logs, 'logs'), QStyle.StandardPixmap.SP_DialogSaveButton),
         ])
@@ -690,8 +1077,14 @@ class Window(QMainWindow):
         self.delay.setRange(1, 30)
         self.delay.setSuffix(' сек.')
         self.delay.setValue(int(float(store.setting('request_delay', '2'))))
-        form.addRow('Интервал между запросами', self.delay)
+        form.addRow('Интервал добавлений', self.delay)
+        self.read_delay = QSpinBox()
+        self.read_delay.setRange(1, 30)
+        self.read_delay.setSuffix(' сек.')
+        self.read_delay.setValue(int(float(store.setting('read_delay', '2'))))
+        form.addRow('Интервал чтения', self.read_delay)
         form.addRow(self.button('Сохранить', self.save_settings))
+        form.addRow(self.button('Обновить кэш источников', self.clear_source_cache))
         form.addRow(self.button('Открыть папку данных', self.open_data))
         form.addRow(self.button('Импортировать прежнюю сессию v5', self.import_legacy))
         security = QLabel('Сессии защищены Windows DPAPI после отключения. Во время работы и после аварийного завершения рабочая база сессии может оставаться незашифрованной. Не передавайте папку данных посторонним.\n\nИспользуется неофициальный API MAX. Ограничения сервиса и приватность участников сохраняются. Обновление приложения выполняется вручную.')
@@ -779,8 +1172,8 @@ class Window(QMainWindow):
         account = self.account_selector.currentData()
         if not account:
             raise ValueError('Сначала добавьте аккаунт')
-        if connected and account not in self.engine.clients:
-            raise ValueError('Подключите выбранный аккаунт по QR-коду')
+        if connected and not self.engine.available(account):
+            raise ValueError('Аккаунт недоступен. Проверьте его статус в разделе «Аккаунты».')
         return account
 
     def reload_accounts(self, select=None):
@@ -800,7 +1193,34 @@ class Window(QMainWindow):
             return
         account = self.account_selector.currentData()
         accounts = self.store.rows('SELECT * FROM accounts ORDER BY rowid')
-        fill(self.accounts, [(row['id'], [row['name'], row['max_id'] or '—', 'Подключён' if row['id'] in self.engine.clients else 'Не подключён', 'Пауза MAX' if row['blocked_until'] > time.time() else '—']) for row in accounts])
+        states = {row['id']: account_display(row, self.engine.connected(row['id'])) for row in accounts}
+        fill(self.accounts, [(row['id'], [row['name'], row['max_id'] or '—', states[row['id']][1], states[row['id']][3] or '—']) for row in accounts])
+        dark = self.store.setting('theme', 'light') == 'dark'
+        colors = ({'green': ('#194535', '#9be7bd'), 'yellow': ('#4c4118', '#ffe28a'),
+                   'red': ('#542b31', '#ffb5bc'), 'gray': ('#363c40', '#c7cfd5')} if dark else
+                  {'green': ('#e0f4e9', '#12613d'), 'yellow': ('#fff1bd', '#705400'),
+                   'red': ('#fde5e7', '#a12437'), 'gray': ('#e9edef', '#52616a')})
+        for index, row in enumerate(accounts):
+            _, title, color, detail = states[row['id']]
+            cell = self.accounts.cellWidget(index, 2)
+            if cell is None:
+                cell = QWidget()
+                cell.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+                layout = QHBoxLayout(cell)
+                layout.setContentsMargins(5, 6, 5, 6)
+                badge = QLabel()
+                badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(badge)
+                self.accounts.setCellWidget(index, 2, cell)
+            badge = cell.findChild(QLabel)
+            badge.setText(title)
+            background, foreground = colors[color]
+            badge.setStyleSheet(f'background:{background};color:{foreground};border-radius:6px;font-size:12px;font-weight:600;padding:2px 6px;')
+            tooltip = '\n'.join([title, detail, 'Обновлён: ' + display_time(row['status_changed']),
+                                 'Ответ MAX: ' + display_time(row['status_checked'])])
+            cell.setToolTip(tooltip)
+            self.accounts.item(index, 2).setToolTip(tooltip)
+            self.accounts.item(index, 3).setToolTip(tooltip)
         chat_rows = self.store.rows('SELECT * FROM chats WHERE account=? ORDER BY name', (account,))
         kind_names = {'CHAT': 'Группа', 'CHANNEL': 'Канал', 'DIALOG': 'Диалог'}
         fill(self.chats, [(row['uid'], [row['name'], kind_names.get(row['kind'], row['kind']), row['uid']]) for row in chat_rows])
@@ -811,8 +1231,9 @@ class Window(QMainWindow):
             FROM jobs j LEFT JOIN accounts a ON a.id=j.account
             LEFT JOIN (SELECT job,COUNT(*) AS done FROM items WHERE state='confirmed' GROUP BY job) i ON i.job=j.id
             WHERE j.deleted=0 ORDER BY j.created DESC''')
-        job_names = {'collect': 'В контакты', 'invite': 'Приглашения', 'forward': 'Пересылка'}
-        fill(self.jobs, [(row['id'], [f'{row["account_name"]}: ' + job_names.get(row['kind'], row['kind']) + f' / {row["chat"] or "вручную"}', STATUS.get(row['status'], row['status']), f'{row["done"]} / {row["amount"]}', (row['message'] or '—').splitlines()[0]]) for row in jobs])
+        job_names = {'collect': 'В контакты', 'invite': 'Приглашения', 'forward': 'Пересылка', 'join': 'Вступления'}
+        fill(self.jobs, [(row['id'], [f'{row["account_name"]}: ' + job_names.get(row['kind'], row['kind']) + ('' if row['kind'] == 'join' else f' / {row["chat"] or "вручную"}'), STATUS.get(row['status'], row['status']), f'{row["done"]} / {row["amount"]}', (row['message'] or '—').splitlines()[0]]) for row in jobs])
+        self.refresh_join_history()
         names = {row['id']: row['name'] for row in accounts}
         fill(self.logs, [(row['id'], [time.strftime('%d.%m %H:%M:%S', time.localtime(row['at'])), names.get(row['account'], '—'), row['message']]) for row in self.store.rows('SELECT * FROM logs ORDER BY id DESC LIMIT 500')])
         for widget in (self.accounts, self.chats, self.sources, self.contacts, self.jobs, self.forward, self.logs):
@@ -821,7 +1242,13 @@ class Window(QMainWindow):
         self.progress.setRange(0, 0 if busy else 100)
         self.progress.setValue(0)
         if account:
-            self.notice.setText(('Подключён' if account in self.engine.clients else 'Не подключён') + f'  ·  Контактов: {len(self.store.contacts(account))}  ·  Аккаунтов: {len(accounts)} / 20')
+            _, title, color, _ = states[account]
+            self.notice.setText(title + f'  ·  Контактов: {len(self.store.contacts(account))}  ·  Аккаунтов: {len(accounts)} / 20')
+            background, foreground = colors[color]
+            self.notice.setStyleSheet(f'background:{background};color:{foreground};')
+        else:
+            self.notice.setText('Выберите или добавьте аккаунт MAX')
+            self.notice.setStyleSheet('')
 
     def fill_sources(self):
         rows = self.store.source_rows()
@@ -887,13 +1314,52 @@ class Window(QMainWindow):
 
     def connect_account(self):
         account = self.account()
-        if QMessageBox.question(self, 'Подключение MAX', 'Войти в свой аккаунт через неофициальный API? Возможны ограничения MAX.') != QMessageBox.StandardButton.Yes:
+        if self.engine.busy(account):
+            raise ValueError('Дождитесь завершения текущей операции этого аккаунта')
+        row = self.store.rows('SELECT connection_state FROM accounts WHERE id=?', (account,))[0]
+        if self.engine.connected(account) and row['connection_state'] not in ('needs_login', 'blocked'):
+            self.footer.setText('Аккаунт уже подключён')
             return
-        self.engine.submit(account, 'connect', self.engine.connect(account))
+        dialog = ConnectDialog(self.account_selector.currentText(), self.engine.vault.has_session(account), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            dialog.deleteLater()
+            return
+        method = dialog.method.currentData()
+        phone = dialog.phone.text() if method == 'phone' else ''
+        dialog.phone.clear()
+        dialog.deleteLater()
+        waiting = QDialog(self)
+        waiting.setWindowTitle('Подключение MAX / ' + self.account_selector.currentText())
+        layout = QVBoxLayout(waiting)
+        layout.addWidget(QLabel('Запрос кода в MAX…' if method == 'phone' else 'Подключение к MAX…'))
+        cancel = QPushButton('Отменить вход')
+        cancel.clicked.connect(waiting.reject)
+        layout.addWidget(cancel)
+        waiting.rejected.connect(lambda: self.cancel_login(account))
+        self.qr_dialogs[account] = waiting
+        self.engine.submit(account, 'connect', self.engine.connect(account, method, phone))
+        waiting.show()
+
+    def cancel_login(self, account):
+        if self.engine.busy(account):
+            self.engine.futures[account].cancel()
+
+    def close_login_dialog(self, account):
+        dialog = self.qr_dialogs.pop(account, None)
+        if dialog:
+            dialog.blockSignals(True)
+            if isinstance(dialog, LoginInputDialog):
+                dialog.value.clear()
+            dialog.close()
+            dialog.deleteLater()
 
     def disconnect_account(self):
         account = self.account()
         self.engine.submit(account, 'disconnect', self.engine.disconnect(account))
+
+    def check_account_status(self):
+        account = self.account()
+        self.engine.submit(account, 'check_status', self.engine.check_account(account))
 
     def rename_account(self):
         account = self.account()
@@ -1062,8 +1528,8 @@ class Window(QMainWindow):
             raise ValueError('Выберите одно задание')
         job = self.store.job(selected[0])
         account = job['account']
-        if account not in self.engine.clients:
-            raise ValueError('Подключите аккаунт этого задания')
+        if not self.engine.available(account):
+            raise ValueError('Аккаунт задания недоступен. Проверьте его статус и подключение.')
         if job['status'] in ('complete', 'running', 'stopped'):
             raise ValueError('Это задание нельзя запустить в текущем состоянии')
         if job['status'] != 'queued' and QMessageBox.question(self, 'Возобновить', 'Перепроверить результаты и возобновить задание? Неподтверждённые операции не повторяются.') != QMessageBox.StandardButton.Yes:
@@ -1085,7 +1551,7 @@ class Window(QMainWindow):
 
     def prepare_multi(self):
         available = [row for row in self.store.rows('SELECT * FROM accounts ORDER BY name')
-                     if row['id'] in self.engine.clients and not self.engine.busy(row['id'])]
+                     if self.engine.available(row['id']) and not self.engine.busy(row['id'])]
         if not available:
             raise ValueError('Нет свободных подключённых аккаунтов')
         dialog = CollectAccountsDialog(self.store, available, self)
@@ -1096,7 +1562,7 @@ class Window(QMainWindow):
             raise ValueError('Выберите аккаунты')
         group = str(time.time_ns())
         for account, chat in selected:
-            if account not in self.engine.clients or self.engine.busy(account):
+            if not self.engine.available(account) or self.engine.busy(account):
                 raise ValueError('Один из выбранных аккаунтов занят или отключён')
         for account, chat in selected:
             self.store.set_setting('collect_source_' + account, chat)
@@ -1105,6 +1571,69 @@ class Window(QMainWindow):
             self.engine.submit(account, 'job', self.engine.run_job(identity))
         self.nav.setCurrentRow(self.names.index('Задания'))
         self.refresh()
+
+    def open_catalog(self):
+        dialog = ChatCatalogDialog(self.store, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.prepare_join(dialog.folder.currentData())
+
+    def prepare_join(self, folder='all'):
+        available = [row for row in self.store.rows('SELECT * FROM accounts ORDER BY name')
+                     if self.engine.available(row['id']) and not self.engine.busy(row['id'])]
+        if not available:
+            raise ValueError('Нет свободных подключённых аккаунтов')
+        dialog = JoinLinksDialog(available, self, folder=folder)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if not dialog.imported or not dialog.imported.entries or not dialog.chosen() or not dialog.consent.isChecked():
+            raise ValueError('Выберите папку с доступными чатами и аккаунты, затем подтвердите вступления')
+        for account in dialog.chosen():
+            if not self.engine.available(account) or self.engine.busy(account):
+                raise ValueError('Один из выбранных аккаунтов занят или отключён')
+        options = {'folder': dialog.folder.currentData(), 'group': str(time.time_ns()),
+                   'invalid': len(dialog.imported.invalid), 'duplicates': dialog.imported.duplicates}
+        for account in dialog.chosen():
+            identity = self.store.new_join_job(account, dialog.imported.entries, dialog.amount.value(), options)
+            self.engine.submit(account, 'job', self.engine.run_job(identity))
+        self.nav.setCurrentRow(self.names.index('Задания'))
+        self.refresh()
+
+    def refresh_join_history(self):
+        account = self.account_selector.currentData()
+        rows = self.store.join_history(account, self.joins.property('filter').text(), state=self.join_state.currentData())
+        fill(self.joins, [((r['job'], r['uid']), [display_time(r['updated']), r['title'],
+                           LINK_STATES.get(r['state'], r['state']), r['link']]) for r in rows])
+        for index in range(self.joins.rowCount()):
+            self.joins.setRowHidden(index, False)
+
+    def join_details(self):
+        selected = self.selected(self.joins)
+        if len(selected) != 1:
+            raise ValueError('Выберите одну запись истории')
+        job, uid = selected[0]
+        row = next(r for r in self.store.join_rows(job) if r['uid'] == uid)
+        QMessageBox.information(self, 'История вступления', '\n'.join([
+            row['title'], row['link'], f'ID группы: {row["chat"] or "не определён"}',
+            f'Результат: {LINK_STATES.get(row["state"], row["state"])}', row['detail'],
+            f'Попыток: {row["attempts"]}', f'Дата: {display_time(row["updated"])}',
+            f'Файл: {json.loads(self.store.job(job)["options"]).get("file", "")}; строка: {row["source"]}',
+        ]))
+
+    def export_join_history(self):
+        account = self.account()
+        filename, _ = QFileDialog.getSaveFileName(self, 'История вступлений', 'join-history.csv', 'CSV (*.csv)')
+        if not filename:
+            return
+        rows = self.store.join_history(account, self.joins.property('filter').text(), limit=-1,
+                                       state=self.join_state.currentData())
+        with open(filename, 'w', encoding='utf-8-sig', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Группа', 'Ссылка', 'ID MAX', 'Результат', 'Подробности', 'Попыток', 'Дата'])
+            for row in rows:
+                writer.writerow([csv_value(value) for value in (
+                    row['title'], row['link'], row['chat'], LINK_STATES.get(row['state'], row['state']),
+                    row['detail'], row['attempts'], display_time(row['updated']))])
+        self.footer.setText(f'Сохранено записей: {len(rows)}')
 
     def control_job(self, action):
         selected = self.selected(self.jobs)
@@ -1156,7 +1685,13 @@ class Window(QMainWindow):
         selected = self.selected(self.jobs)
         if len(selected) != 1:
             raise ValueError('Выберите задание нужного запуска')
-        BatchReportDialog(self.store.batch_report(selected[0]), self).exec()
+        job = self.store.job(selected[0])
+        if job['kind'] == 'join':
+            rows = self.store.batch_report(selected[0])
+            QMessageBox.information(self, 'Общий отчёт', '\n\n'.join(
+                r['account_name'] + '\n' + self.engine.job_report(r['id']) for r in rows))
+        else:
+            BatchReportDialog(self.store.batch_report(selected[0]), self).exec()
 
     def export(self, widget, name):
         path, _ = QFileDialog.getSaveFileName(self, 'Экспорт CSV', name + '.csv', 'CSV (*.csv)')
@@ -1178,6 +1713,13 @@ class Window(QMainWindow):
         if path:
             with open(path, 'w', encoding='utf-8-sig', newline='') as file:
                 writer = csv.writer(file)
+                if self.store.job(selected[0])['kind'] == 'join':
+                    writer.writerow(['Группа', 'Ссылка', 'ID MAX', 'Результат', 'Подробности', 'Попыток', 'Дата'])
+                    for row in self.store.join_rows(selected[0]):
+                        writer.writerow([csv_value(value) for value in (
+                            row['title'], row['link'], row['chat'], LINK_STATES.get(row['state'], row['state']),
+                            row['detail'], row['attempts'], display_time(row['updated']))])
+                    return
                 writer.writerow(['ID MAX', 'Состояние', 'Подробности', 'Попыток', 'Обновлено'])
                 for row in self.store.item_rows(selected[0]):
                     writer.writerow([row['uid'], row['state'], row['detail'], row['attempts'],
@@ -1185,12 +1727,20 @@ class Window(QMainWindow):
 
     def save_settings(self):
         self.store.set_setting('request_delay', self.delay.value())
+        self.store.set_setting('read_delay', self.read_delay.value())
         self.footer.setText('Настройки сохранены')
 
     def change_theme(self):
         theme = self.theme.currentData()
         self.store.set_setting('theme', theme)
         apply_theme(QApplication.instance(), theme)
+        self.refresh()
+
+    def clear_source_cache(self):
+        if any(self.engine.busy(account) for account in self.engine.futures):
+            raise ValueError('Дождитесь завершения текущих операций')
+        self.store.execute('DELETE FROM source_pages')
+        self.footer.setText('Кэш очищен. Следующий сбор загрузит участников из MAX.')
 
     def open_data(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.directory)))
@@ -1210,12 +1760,13 @@ class Window(QMainWindow):
         account = self.account()
         if account in self.engine.clients or self.engine.busy(account):
             raise ValueError('Сначала отключите аккаунт')
-        if QMessageBox.question(self, 'Удаление данных', 'Удалить локальную сессию, контакты и задания выбранного аккаунта? Это не отзывает сессию на сервере MAX.') != QMessageBox.StandardButton.Yes:
+        if QMessageBox.question(self, 'Удаление данных', 'Удалить локальную сессию, контакты, задания и историю аккаунта? Общий реестр занятых групп сохранится. Это не отзывает сессию на сервере MAX.') != QMessageBox.StandardButton.Yes:
             return
         folder = self.engine.vault.folder(account)
         for name in ('session.protected', 'session.protected.new', 'session.db', 'session.db-wal', 'session.db-shm'):
             (folder / name).unlink(missing_ok=True)
         with self.store.db() as db:
+            db.execute('DELETE FROM join_targets WHERE job IN (SELECT id FROM jobs WHERE account=?)', (account,))
             db.execute('DELETE FROM items WHERE job IN (SELECT id FROM jobs WHERE account=?)', (account,))
             db.execute('DELETE FROM harvest_claims WHERE account=?', (account,))
             for name in ('contacts', 'chats', 'jobs', 'logs'):
@@ -1228,6 +1779,7 @@ class Window(QMainWindow):
             return
         if kind == 'qr':
             account, url = data
+            self.close_login_dialog(account)
             dialog = QDialog(self)
             dialog.setWindowTitle('Подтверждение MAX')
             layout = QVBoxLayout(dialog)
@@ -1242,20 +1794,33 @@ class Window(QMainWindow):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(label)
             layout.addWidget(QLabel('Ожидание подтверждения на телефоне'))
-            cancel = self.button('Отменить', lambda: self.engine.futures[account].cancel())
+            cancel = self.button('Отменить', dialog.reject)
             layout.addWidget(cancel)
-            dialog.rejected.connect(lambda: self.engine.futures[account].cancel() if self.engine.busy(account) else None)
+            dialog.rejected.connect(lambda: self.cancel_login(account))
             self.qr_dialogs[account] = dialog
             dialog.show()
-        elif kind == 'password':
-            account, future = data
-            value, ok = QInputDialog.getText(self, 'MAX / 2FA', 'Пароль аккаунта', QLineEdit.EchoMode.Password)
-            if not future.done():
-                future.set_result(value if ok else None)
+        elif kind in ('code', 'password'):
+            account, future, *detail = data
+            self.close_login_dialog(account)
+            if future.done():
+                return
+            rows = self.store.rows('SELECT name FROM accounts WHERE id=?', (account,))
+            dialog = LoginInputDialog(kind, detail[0] if detail else '', rows[0]['name'] if rows else 'MAX', self)
+            def finish(accepted):
+                value = dialog.value.text() if accepted else None
+                dialog.value.clear()
+                try:
+                    future.set_result(value)
+                except concurrent.futures.InvalidStateError:
+                    pass
+            dialog.accepted.connect(lambda: finish(True))
+            dialog.rejected.connect(lambda: finish(False))
+            self.qr_dialogs[account] = dialog
+            dialog.show()
+            dialog.value.setFocus()
         elif kind in ('result', 'error'):
             account = data[0]
-            if account in self.qr_dialogs:
-                self.qr_dialogs.pop(account).accept()
+            self.close_login_dialog(account)
             if kind == 'error':
                 self.footer.setText(data[1])
                 QMessageBox.warning(self, 'Ответ MAX', data[1])
@@ -1274,6 +1839,12 @@ class Window(QMainWindow):
                     self.footer.setToolTip(str(result))
                     if tag == 'connect':
                         self.reload_accounts(account)
+        if not getattr(self, '_refresh_queued', False):
+            self._refresh_queued = True
+            QTimer.singleShot(200, self.flush_refresh)
+
+    def flush_refresh(self):
+        self._refresh_queued = False
         self.refresh()
 
     def closeEvent(self, event):

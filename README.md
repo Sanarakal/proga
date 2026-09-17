@@ -2,20 +2,28 @@
 
 Windows desktop application for managing MAX accounts, collection jobs and reports.
 
+Current release: MAX Workspace 1.8 (Qt / Windows). Phone and QR login, account
+status badges, contact collection, invitations, reports and a shared chat catalog.
+
+**Перенос на ноутбук и восстановление сессий: [TRANSFER.md](TRANSFER.md).**
+Clone this repository and run `setup-workspace.ps1`. Restore the separate encrypted
+transfer archive before launching the application for the first time.
+Never upload account data, transfer archives or recovery keys to this repository.
+
 ## Run From Source
 
 Requires Windows and Python 3.13. In PowerShell:
 
 ```powershell
 py -3.13 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements-workspace.txt
+.venv\Scripts\python.exe -m pip install -r requirements-lock.txt
 .venv\Scripts\python.exe workspace_ui.py
 ```
 
 Test the current application:
 
 ```powershell
-.venv\Scripts\python.exe -m unittest test_workspace test_workspace_ui
+.venv\Scripts\python.exe -m unittest test_transfer_workspace test_workspace_status test_workspace_auth test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_workflows
 ```
 
 Build with `build-workspace.ps1`, then install with `install-workspace.ps1`.

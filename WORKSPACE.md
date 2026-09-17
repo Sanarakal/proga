@@ -1,4 +1,132 @@
-# MAX Workspace 1.0
+# MAX Workspace 1.8
+
+## Account Status (1.8)
+
+Accounts show text badges: green connected, yellow login required, red restricted
+or blocked, gray offline/connecting/network error. A compact reason is displayed
+beside the badge; hover shows transition time and last MAX reply. Both themes are
+supported. Check status sends one read-only PING to an existing connection and
+never starts authentication or a job. Offline accounts must first connect.
+
+Status and transition logs persist in SQLite. On restart, live/connecting states
+become offline; confirmed logout, block and rate-limit states survive. A local
+two-second transport check retires disconnected idle clients. PyMax's existing
+PING responses and raw logout/error events update status without extra polling
+requests. No automatic reauthentication or job restart is added.
+
+Only explicit session/account error codes set logout/block states. Target-user
+block errors on contact operations, group permissions and generic forbidden
+responses are not evidence that the current account is blocked. Unknown server
+codes are not guessed. Network failure never erases a known block/restriction.
+A five-minute local flood pause is not the server's ban duration. Expiry or a
+successful PING does not prove the limit lifted; a later successful user-requested
+operation can clear it. Tasks and multi-account selection respect these states.
+
+Run `python -m unittest test_workspace_status test_workspace_auth test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_app test_workflows`.
+
+## Phone Login (1.7)
+
+Accounts > Connect offers QR, phone, and saved-session login. Existing sessions
+are reused by PyMax before either interactive flow. The phone is normalized to
+international format; Russian 8/7 prefixes with 11 digits are accepted. The
+SmsAuthFlow adapter supplies the phone to the WEB runtime without changing the
+transport or saved device identity. Server support and code delivery are not
+guaranteed; QR remains available. There is no automatic resend or registration.
+
+Code/password dialogs are nonmodal and isolated per account. Cancellation and
+the 240-second deadline close authentication; failed clients are closed and
+sessions sealed with DPAPI. Code and password are never saved in app settings or
+logs. Authentication API error payloads are replaced with credential-free messages.
+2FA is checked once per manual login attempt, without an automatic retry loop.
+Existing MAX account identity and duplicate-account checks apply to both modes.
+
+Run `python -m unittest test_workspace_auth test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_app test_workflows`.
+Auth tests mock network calls; live phone delivery requires a user login test.
+
+## Chat Catalog (1.6)
+
+Product workflow: Joining > Chat catalog > import one or several files >
+All chats > create a joining job. Files populate a shared persistent catalog,
+not separate per-account lists. The dialog supports drag-and-drop, search,
+available-only filtering, per-group account/state and an inactive-link audit view.
+The first folder is All chats; folder membership is stored separately so future
+folders can share groups without making copies. No extra folders are exposed yet.
+
+Imports are parsed locally on a worker. Original files and parsed snapshots are
+saved in SQLite together with catalog inserts in one transaction. Reimporting
+the same file or overlapping files does not duplicate links. Moving/deleting
+the source file has no effect on the catalog. Stored older job lists are migrated
+once on upgrade; these recovered lists do not contain the original workbook bytes.
+
+Identity has two stages: normalized invitation link before MAX resolution, then
+MAX chat ID. Known alternate links are merged in the catalog. Until resolution,
+two different URLs can still represent one group; the global chat-ID claim
+prevents double joining even in that case. Counts of unresolved entries represent
+unique links, not a guarantee that every entry is a different live group.
+
+Global joining reservations use BEGIN IMMEDIATE and unique link/chat keys.
+Every account checks this ledger before resolution and again before sending.
+Confirmed entries and ambiguous pending writes survive task/account deletion.
+Unsent reservations are released on pause/error/exit or application restart.
+An ambiguous write is never automatically retried or assigned to another account.
+Existing recorded confirmed/pending joins are backfilled on upgrade. Memberships
+made outside this app can only be recognized when MAX reports them to this app.
+
+Inactive links are removed from the working catalog, retaining a tombstone with
+the reason/time so reimport cannot revive them. Explicit link-expired/invalid
+errors or not-found during LINK_INFO are sufficient evidence. A generic not-found
+from CHAT_JOIN is followed by LINK_INFO; only its explicit missing/expired reply
+archives the link. Empty/ambiguous responses, timeouts, flood limits, full groups
+and access restrictions never remove a link. A known alternate invitation URL
+can remain active if only one URL expired. Existing jobs recheck tombstones.
+
+Acceptance checks include concurrent accounts with matching and alias URLs,
+crash/pause recovery, preserved pending writes, migration from old tasks,
+cross-file deduplication, restart persistence, inactive-link reimports, folder
+scoping, async multi-file import, and light/dark layouts at minimum sizes.
+Run `python -m unittest test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_app test_workflows`.
+
+## Previous Releases
+
+1.5.1 treats `not.found` / `errors.not.found` from CHAT_JOIN (57) and LINK_INFO
+(89) as unavailable groups and continues toward the quota. On startup, pending
+join records saved by 1.5 with an explicit not-found CHAT_JOIN rejection are
+reclassified as unavailable. The saved error and attempt count are preserved;
+the job still requires manual resume. Timeouts and other uncertain writes are
+never repaired by this migration or automatically resubmitted.
+
+## Join Groups From Files (1.5)
+
+The Joining page imports XLSX, CSV or TXT locally, including Excel hyperlink
+targets and literal HYPERLINK formulas (formulas are never evaluated). Import
+runs on a worker thread. Accepted invitation URLs are max.ru/join/... and
+web.max.ru/join/...; other domains and non-group URLs are excluded. An explicit
+link column takes precedence over URLs in descriptions. Duplicates are normalized.
+Preview is capped at 200 entries, but the entire imported list is used.
+File limits: 30 MB compressed, 100 MB expanded, 500,000 cells, 50,000 links.
+
+Select connected accounts, a quota of new groups per account and confirm Start.
+Each selected account gets the same list and its own job. Invalid links, unavailable
+groups and previous memberships are skipped while searching for new groups until
+the quota or end of file. Only group chats are supported, not channel subscriptions.
+MAX flood/too-many replies stop the job under the existing manual-resume policy.
+
+History is keyed by account, link and resolved chat ID. It survives restart and
+job deletion, but is explicitly removed with the local account. History supports
+case-insensitive search, status filters and CSV export of all matching records;
+the on-screen view displays up to 1000 matching records. Local metadata is not encrypted.
+
+Before every join write, a pending item is committed. A returned group must match
+the resolved group and prove participation (current user in participants/owner/admins,
+or ACTIVE status with a positive join timestamp). Missing or unknown confirmation,
+including possible approval requests, remains pending and stops the job. No blind
+repeat is made after a timeout or ambiguous response. Resume uses a fresh link-info
+request to reconcile pending records. Recognized group/link errors are skipped;
+unknown errors stop and are not mislabeled as expired links. Past confirmed groups
+are not automatically rejoined even if the user subsequently left them in MAX.
+
+Live joins are not part of development tests. Run tests with:
+`python -m unittest test_workspace test_workspace_links test_workspace_ui test_app test_workflows`.
 
 Windows desktop application built with Qt / PySide6 and the unofficial PyMax API.
 This is a locally tested first release, not a guarantee of live MAX capabilities.
@@ -93,6 +221,15 @@ requires explicit selection review and launch. Favorites reorder the chat list
 without excluding non-favorites from search. The combined report includes all
 jobs sharing the run ID, including locally archived jobs, and exports a CSV
 snapshot. Neither report viewing nor template loading sends MAX requests.
+
+Version 1.4 caches collection pages for five minutes per account and source.
+The remaining candidates can be reused by later jobs; invitation membership
+checks never use this cache. Explicit invalid/expired marker errors restart a
+scan once; rate-limit errors still suspend it. Settings offers a cache reset.
+Read and mutation pacing use separate clocks, both defaulting to two seconds.
+Collection success is committed atomically with the contact, ledger and job
+progress. Reports persist accumulated active execution time, pacing time,
+API wait time, API invocation count and cached-page count across resumes.
 
 Build: `.venv/Scripts/python.exe -m PyInstaller --noconfirm --onedir --windowed
 --collect-all pymax --name MAX-Workspace workspace_ui.py`.
