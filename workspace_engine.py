@@ -270,6 +270,9 @@ class Engine(QObject):
 
     def job_report(self, job_or_id):
         job = self.store.job(job_or_id) if isinstance(job_or_id, str) else job_or_id
+        if job['kind'] == 'broadcast':
+            from workspace_broadcast import broadcast_report
+            return broadcast_report(self.store, job['id'])
         if job['kind'] == 'join':
             rows = self.store.join_rows(job['id'])
             counts = {state: sum(r['state'] == state for r in rows) for state in
@@ -341,7 +344,7 @@ class Engine(QObject):
             lines.append(f'Вызовов API: {totals["requests"]}; страниц из кэша: {totals["cached_pages"]}')
         return '\n'.join(lines)
 
-    async def request(self, account, operation, *args, **kwargs):
+    async def request(self, account, operation, *args, _timeout=45, **kwargs):
         row = self.store.rows('SELECT blocked_until,connection_state FROM accounts WHERE id=?', (account,))[0]
         if row['connection_state'] in ('needs_login', 'blocked'):
             raise JobPaused('Аккаунт недоступен: ' + ('требуется вход' if row['connection_state'] == 'needs_login' else 'заблокирован'))
@@ -368,7 +371,7 @@ class Engine(QObject):
         if metrics:
             metrics['requests'] += 1
         try:
-            result = await asyncio.wait_for(operation(*args, **kwargs), 45)
+            result = await asyncio.wait_for(operation(*args, **kwargs), _timeout)
             if row['connection_state'] in ('limited', 'network_error', 'error'):
                 current = self.store.rows('SELECT connection_state,blocked_until FROM accounts WHERE id=?', (account,))[0]
                 if current['connection_state'] not in ('blocked', 'needs_login') and current['blocked_until'] <= time.time():
@@ -905,7 +908,7 @@ class Engine(QObject):
         account = job['account']
         self.flags.pop(identity, None)
         initial = ('Проверка ссылок' if job['kind'] == 'join' else
-                   'Проверка сообщения' if job['kind'] == 'forward' else 'Проверка участников')
+                   'Проверка сообщения' if job['kind'] in ('forward', 'broadcast') else 'Проверка участников')
         self.store.status(identity, 'running', initial)
         self.event.emit('changed', account)
         self.metrics[account] = dict(job=identity, started=time.monotonic(), waiting=0., network=0., requests=0, cached_pages=0)
@@ -917,6 +920,9 @@ class Engine(QObject):
             blocked = self.store.rows('SELECT blocked_until FROM accounts WHERE id=?', (account,))[0]['blocked_until']
             if blocked > time.time():
                 raise JobPaused('Локальная пауза после ограничения MAX ещё не закончилась')
+            if job['kind'] == 'broadcast':
+                from workspace_broadcast import run_broadcast
+                return await run_broadcast(self, job, client)
             own_id = client.me.contact.id
             if job['kind'] == 'join':
                 return await self.run_join_job(job, client)

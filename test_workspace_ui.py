@@ -56,6 +56,16 @@ class InterfaceTests(unittest.TestCase):
                     minimum = button.fontMetrics().horizontalAdvance(button.text()) + 32 + (24 if not button.icon().isNull() else 0)
                     self.assertGreaterEqual(button.width(), minimum, button.text())
 
+    def test_broadcast_folder_result_does_not_expand_footer(self):
+        self.window.on_engine_event('result', (self.account, ('broadcast_groups', 1), [('Folder', list(range(1000)))]))
+        self.assertEqual(self.window.footer.text(), 'Список чатов обновлён')
+
+    def test_import_history_result_does_not_expose_attachment_tokens(self):
+        from test_post_import import message, PHOTO, VIDEO
+        self.window.on_engine_event('result', (self.account, ('post_import_history', 1), [message([PHOTO, VIDEO])]))
+        self.assertEqual(self.window.footer.text(), 'Данные для импорта загружены')
+        self.assertNotIn('PRIVATE', self.window.footer.text())
+
     def test_account_badges_and_theme_have_readable_text(self):
         self.window.engine.clients[self.account] = SimpleNamespace(is_connected=True, close=AsyncMock())
         for theme in ('light', 'dark'):

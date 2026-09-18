@@ -8,6 +8,7 @@ from workspace_ui import Window, ForwardDialog, SourceMembersDialog, CollectAcco
 from workspace_links import LinkImport
 from workspace_store import Store
 from workspace_ui import ConnectDialog, LoginInputDialog
+from workspace_posts_ui import PostEditor, BroadcastWizard, BroadcastReport
 
 
 app = QApplication([])
@@ -178,4 +179,49 @@ with tempfile.TemporaryDirectory() as directory:
     app.processEvents()
     batch.grab().save(str(output / 'batch-dark.png'))
     batch.close()
+    sample = Path(os.environ.get('WINDIR', 'C:/Windows')) / 'Web/Wallpaper/Windows/img0.jpg'
+    photos = [store.add_post_photo(sample)] if sample.exists() else []
+    post = store.save_post(None, 'Анонс встречи', dict(
+        text='Встреча участников\nВ пятницу в 19:00. Подробности на сайте.',
+        elements=[{'type': 'STRONG', 'from': 0, 'length': 18},
+                  {'type': 'LINK', 'from': 33, 'length': 20, 'url': 'https://example.com/event'}],
+        photos=photos), True)
+    broadcast = store.new_broadcast(post, account, [-100, -101], 'Вечерняя встреча', {'interval': 60, 'rounds': 2})
+    store.begin_delivery(account, broadcast, 1)
+    store.finish_delivery(broadcast, 1, 'confirmed', 'MAX подтвердил отправку', '123')
+    for theme in ('light', 'dark'):
+        apply_theme(app, theme)
+        store.set_setting('theme', theme)
+        window.nav.setCurrentRow(5)
+        window.show()
+        for width, height in ((1180, 780), (920, 640)):
+            window.resize(width, height)
+            for tab_index in (0, 1):
+                window.posts_page.tabs.setCurrentIndex(tab_index)
+                window.refresh()
+                app.processEvents()
+                window.grab().save(str(output / f'posts-{theme}-{width}-{tab_index}.png'))
+        window.hide()
+        editor = PostEditor(store, post)
+        wizard = BroadcastWizard(store, window.engine, post)
+        wizard.select_visible(True)
+        wizard.update_review()
+        report = BroadcastReport(store, window.engine, broadcast)
+        for widget, name in ((editor, 'editor'), (wizard, 'wizard'), (report, 'broadcast-report')):
+            widget.show()
+            for width, height in ((820, 680), (640, 560)):
+                widget.resize(width, height)
+                steps = range(4) if widget is wizard else range(1)
+                for step in steps:
+                    if widget is wizard:
+                        wizard.steps.setCurrentIndex(step)
+                        wizard.show_step()
+                    app.processEvents()
+                    assert widget.width() <= width, (name, widget.width(), width)
+                    for control in widget.findChildren(QPushButton):
+                        if control.isVisible():
+                            needed = control.fontMetrics().horizontalAdvance(control.text()) + 32 + (24 if not control.icon().isNull() else 0)
+                            assert control.width() >= needed, (name, control.text(), control.width(), needed)
+                    widget.grab().save(str(output / f'{name}-{theme}-{width}-{step}.png'))
+            widget.reject()
 print('Rendered all pages at desktop and minimum window sizes')

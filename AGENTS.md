@@ -64,8 +64,9 @@
 Для воспроизводимого окружения использовать `requirements-lock.txt`.
 
 ```powershell
-.venv\Scripts\python.exe -m unittest test_transfer_workspace test_workspace_status test_workspace_auth test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_workflows -q
+.venv\Scripts\python.exe -m unittest test_transfer_workspace test_workspace_status test_workspace_auth test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_workspace_posts test_post_import test_workflows -q
 .venv\Scripts\python.exe render_workspace.py
+.venv\Scripts\python.exe render_post_import.py
 ```
 
 После изменений интерфейса посмотреть полученные картинки из `preview`.

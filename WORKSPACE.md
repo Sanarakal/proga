@@ -1,4 +1,95 @@
-# MAX Workspace 1.8
+# MAX Workspace 1.10
+
+## Import Posts From MAX (1.10)
+
+The message picker uses a multiline history list and a responsive side-by-side
+preview (stacked on narrow windows). Load more scrolls to the first newly loaded
+message; empty/non-advancing pages disable further loading until a refresh.
+Photo/video thumbnails download only on explicit request, with bounded public
+HTTPS downloads, and never create posts or retain source tokens in the database.
+
+My posts > Import from MAX selects an already connected account, its source chat
+and a message from paged history or a numeric message ID. Import is read-only on
+MAX and saves a local reusable post atomically after all attachments download.
+Text, whitespace, hyperlinks, formatting entities and attachment order are retained.
+Photos retain original downloaded bytes; MP4 video is stored locally and uploaded
+through the MAX library when sending. Photo and video preview is available by
+double-clicking an attachment. Saved media is included in encrypted transfers.
+
+Bounds: 4000 UTF-16 text units, 10 attachments, 50 MB per imported attachment,
+40 megapixels per photo, 128 MB total retained media. Unsupported attachments
+(including SHARE preview cards, files, polls and stickers) reject the entire
+import explicitly, rather than silently losing content. Text hyperlinks work.
+INLINE_KEYBOARD is automatically omitted, as requested by the user. A successful
+import explicitly notifies that buttons and their embedded links were omitted;
+photos and text hyperlinks are retained. Only PHOTO/VIDEO count toward the
+ten-media limit. Other unsupported types remain blocked. Failed photo downloads
+abort the entire import, rather than silently saving fewer photos.
+Complex formatting is retained but text editing is locked when the Qt editor
+cannot round-trip it safely. Titles and attachment order remain editable.
+
+Downloads require public HTTPS addresses, check redirect/DNS targets and enforce
+streaming size/time limits. Signed URLs and source attachment tokens are not saved
+in posts or shown in result messages. Failed/cancelled imports leave no partial post.
+Tests use mocked MAX responses, not live accounts or real sends. Offline video
+preview is verified by encoding and decoding a real MP4 with Qt Multimedia.
+
+Modules: `workspace_post_import.py`, `workspace_post_import_ui.py`.
+Checks: `test_post_import.py`, `render_post_import.py` plus the existing suite.
+
+## Saved Posts And Broadcasts (1.9)
+
+Forwarding now opens My posts / Broadcasts. Create a post with a local title,
+rich text (bold, italic, underline, HTTP/HTTPS links) and up to 10 photos.
+The editor autosaves drafts and supports duplicate, search, reorder, file drop
+and preview. Pasted text is plain; links and formatting are explicit structured
+entities with UTF-16 offsets, not reparsed Markdown. Local safeguards: 4000 UTF-16
+units, 10 MB per source photo, 40 megapixels, 128 MB of retained photo data.
+These are application bounds, not claims about MAX server limits. Photos are
+normalized to JPEG (EXIF orientation applied, metadata removed, max 4096 pixels),
+stored as SQLite blobs and included in the existing encrypted transfer archive.
+Source files can be removed without losing saved post photos.
+
+Create broadcast opens four steps: account, chats, settings, review. Chat
+selection survives search, supports explicit MAX folder membership and saved
+per-account sets. All CHAT, CHANNEL and DIALOG conversations for the selected
+account are shown with their type. Entering the recipient step refreshes the
+list for a connected free account; offline accounts show the last cached list.
+Channels may reject publishing if the account has no permission. Settings include a fixed interval,
+batch pause, local start/end date, 1-100 passes with a pause between passes,
+working hours (including overnight), account-wide daily attempt cap, notifications
+and a policy for explicit group-write denial. At most 1000 groups and 10000
+deliveries per job. Creating a job does not send; press Start to arm it, including
+scheduled jobs. The app must remain open and the account connected. An armed
+job occupies that account until paused, stopped or complete.
+
+Each job stores an immutable content snapshot and durable per-group/per-pass
+records with client message IDs. Editing/deleting the library post cannot change
+existing jobs. Photos referenced by archived jobs are retained. All sending uses
+MAX payload models and one MSG_SEND invocation; no automatic message retries.
+Photo uploads run before message intent. A transactional pending record and daily
+attempt entry precede each send. Confirmation stores the server message ID and
+checks returned chat/client IDs when supplied. Unknown responses/timeouts stay
+pending and block resume until manual confirmation or skip without resending in
+the report. Explicit MAX rejections may be retried only through manual resume.
+Reports offer per-recipient results and CSV export with formula-safe cells.
+Optional test send is a separate one-recipient job with an explicit confirmation.
+Its recipient remains selected for the main broadcast, which may send again.
+
+Pause/stop take effect before the next send; in-flight requests cannot be undone.
+Restart never auto-arms jobs. A scheduling gap over 15 seconds or backward clock
+change pauses waiting jobs to avoid catch-up sends after sleep. The start time
+is local to this laptop. Daily caps count attempts across broadcast jobs for
+the same account, including failed/uncertain sends. No live MAX send was used
+for development verification; multi-photo presentation and account permissions
+must be verified by the user with the explicit test-send control.
+
+Tests: `python -m unittest test_workspace_posts` plus the existing suite.
+`render_workspace.py` additionally renders posts, editor, all wizard steps and
+delivery reports in both themes at 640/820 dialog widths and 920/1180 main widths.
+Core files: `workspace_posts.py` (storage/validation), `workspace_posts_ui.py`
+(Qt views), `workspace_broadcast.py` (transport and runner). Existing forward
+job records and their runner remain supported.
 
 ## Account Status (1.8)
 

@@ -26,6 +26,7 @@ from workspace_engine import Engine
 from workspace_auth import normalize_phone
 from workspace_status import account_display
 from workspace_links import read_links, LINK_STATES, csv_value, LinkImport
+from workspace_posts_ui import PostsPage, BroadcastReport
 
 
 STATUS = {'queued': 'Готово к запуску', 'running': 'Выполняется', 'paused': 'На паузе',
@@ -110,6 +111,12 @@ QHeaderView::section { background: #f1f4f5; color: #586a73; border: none; border
 QProgressBar { border: none; background: #e5ecee; border-radius: 4px; height: 8px; }
 QProgressBar::chunk { background: #16755b; border-radius: 4px; }
 QDialog { background: #f5f7f8; }
+QTextEdit, QTextBrowser { background: #ffffff; border: 1px solid #ccd6db; padding: 8px; }
+QDateTimeEdit, QTimeEdit { background: #ffffff; border: 1px solid #ccd6db; border-radius: 5px; padding: 7px; min-height: 20px; }
+QTabWidget::pane { border: 1px solid #dfe5e8; }
+QTabBar::tab { background: #edf1f3; padding: 8px 14px; border-bottom: 2px solid transparent; }
+QTabBar::tab:selected { background: #ffffff; border-bottom-color: #16755b; }
+QListWidget#postPhotos::item { padding: 3px; margin: 2px; }
 '''
 
 DARK_STYLE = '''
@@ -132,6 +139,10 @@ QHeaderView::section { background: #303438; color: #c3cbd1; border-color: #43484
 QProgressBar { background: #3a4044; color: #edf0f2; }
 QProgressBar::chunk { background: #27664e; }
 QToolTip { background: #303438; color: #edf0f2; border: 1px solid #687279; padding: 5px; }
+QTextEdit, QTextBrowser, QDateTimeEdit, QTimeEdit { background: #292c2f; border-color: #50585e; color: #edf0f2; }
+QTabWidget::pane { border-color: #43484c; }
+QTabBar::tab { background: #303438; color: #c3cbd1; }
+QTabBar::tab:selected { background: #292c2f; color: #edf0f2; border-bottom-color: #7ed1ae; }
 '''
 
 
@@ -953,7 +964,7 @@ class Window(QMainWindow):
         self.engine.event.connect(self.on_engine_event)
         self.qr_dialogs = {}
         self.closing = False
-        self.setWindowTitle('MAX Workspace — 1.8')
+        self.setWindowTitle('MAX Workspace — 1.10')
         self.resize(1180, 780)
         self.setMinimumSize(920, 640)
         outer = QWidget()
@@ -974,7 +985,7 @@ class Window(QMainWindow):
         self.names = ['Аккаунты', 'Чаты', 'Источники', 'Контакты', 'Задания', 'Пересылка', 'Вступления', 'Журнал', 'Настройки']
         self.nav.addItems(self.names)
         side.addWidget(self.nav, 1)
-        version = QLabel('Windows / версия 1.8')
+        version = QLabel('Windows / версия 1.10')
         version.setObjectName('muted')
         side.addWidget(version)
         shell.addWidget(sidebar)
@@ -1043,9 +1054,8 @@ class Window(QMainWindow):
             ('CSV', self.export_job, QStyle.StandardPixmap.SP_DialogSaveButton),
             ('Удалить', self.delete_job, QStyle.StandardPixmap.SP_TrashIcon),
         ], compact=True)
-        self.forward = self.make_page(['Исходный чат', 'Тип', 'ID MAX'], [
-            ('Новое задание', self.prepare_forward, QStyle.StandardPixmap.SP_ArrowForward),
-        ])
+        self.posts_page = PostsPage(store, self.engine, self)
+        self.pages.addWidget(self.posts_page)
         self.joins = self.make_page(['Дата', 'Группа', 'Результат', 'Ссылка'], [
             ('База чатов', self.open_catalog, None),
             ('Новое задание', self.prepare_join, None),
@@ -1224,19 +1234,19 @@ class Window(QMainWindow):
         chat_rows = self.store.rows('SELECT * FROM chats WHERE account=? ORDER BY name', (account,))
         kind_names = {'CHAT': 'Группа', 'CHANNEL': 'Канал', 'DIALOG': 'Диалог'}
         fill(self.chats, [(row['uid'], [row['name'], kind_names.get(row['kind'], row['kind']), row['uid']]) for row in chat_rows])
-        fill(self.forward, [(row['uid'], [row['name'], kind_names.get(row['kind'], row['kind']), row['uid']]) for row in chat_rows])
+        self.posts_page.refresh()
         fill(self.contacts, [(row['uid'], [row['name'] or 'Без имени', row['uid'], row.get('label', ''), row['source']]) for row in self.store.contacts(account)])
         self.fill_sources()
         jobs = self.store.rows('''SELECT j.*,a.name AS account_name,COALESCE(i.done,0) AS done
             FROM jobs j LEFT JOIN accounts a ON a.id=j.account
             LEFT JOIN (SELECT job,COUNT(*) AS done FROM items WHERE state='confirmed' GROUP BY job) i ON i.job=j.id
             WHERE j.deleted=0 ORDER BY j.created DESC''')
-        job_names = {'collect': 'В контакты', 'invite': 'Приглашения', 'forward': 'Пересылка', 'join': 'Вступления'}
+        job_names = {'collect': 'В контакты', 'invite': 'Приглашения', 'forward': 'Пересылка', 'join': 'Вступления', 'broadcast': 'Рассылка поста'}
         fill(self.jobs, [(row['id'], [f'{row["account_name"]}: ' + job_names.get(row['kind'], row['kind']) + ('' if row['kind'] == 'join' else f' / {row["chat"] or "вручную"}'), STATUS.get(row['status'], row['status']), f'{row["done"]} / {row["amount"]}', (row['message'] or '—').splitlines()[0]]) for row in jobs])
         self.refresh_join_history()
         names = {row['id']: row['name'] for row in accounts}
         fill(self.logs, [(row['id'], [time.strftime('%d.%m %H:%M:%S', time.localtime(row['at'])), names.get(row['account'], '—'), row['message']]) for row in self.store.rows('SELECT * FROM logs ORDER BY id DESC LIMIT 500')])
-        for widget in (self.accounts, self.chats, self.sources, self.contacts, self.jobs, self.forward, self.logs):
+        for widget in (self.accounts, self.chats, self.sources, self.contacts, self.jobs, self.logs):
             self.filter_table(widget, widget.property('filter').text())
         busy = bool(account and self.engine.busy(account))
         self.progress.setRange(0, 0 if busy else 100)
@@ -1490,7 +1500,7 @@ class Window(QMainWindow):
         chats = self.store.rows('SELECT * FROM chats WHERE account=? ORDER BY name', (account,))
         if not chats:
             raise ValueError('Сначала обновите список чатов')
-        selected = self.selected(self.forward)
+        selected = self.selected(self.chats)
         source = selected[0] if len(selected) == 1 else None
         if source is None:
             names = [f'{row["name"]} / {row["uid"]}' for row in chats]
@@ -1654,6 +1664,9 @@ class Window(QMainWindow):
             raise ValueError('Выберите одно задание')
         job = self.store.job(selected[0])
         if job['kind'] != 'invite':
+            if job['kind'] == 'broadcast':
+                BroadcastReport(self.store, self.engine, job['id'], self).exec()
+                return
             raise ValueError('Ручная проверка доступна только для приглашений')
         if job['status'] == 'running':
             raise ValueError('Сначала поставьте задание на паузу')
@@ -1679,7 +1692,10 @@ class Window(QMainWindow):
         selected = self.selected(self.jobs)
         if len(selected) != 1:
             raise ValueError('Выберите одно задание')
-        QMessageBox.information(self, 'Отчёт задания', self.engine.job_report(selected[0]))
+        if self.store.job(selected[0])['kind'] == 'broadcast':
+            BroadcastReport(self.store, self.engine, selected[0], self).exec()
+        else:
+            QMessageBox.information(self, 'Отчёт задания', self.engine.job_report(selected[0]))
 
     def show_batch_report(self):
         selected = self.selected(self.jobs)
@@ -1831,6 +1847,10 @@ class Window(QMainWindow):
                     self.guarded(lambda: self.show_preview(account, result, tag[1], tag[2], label))
                 elif isinstance(tag, tuple) and tag[0] == 'history':
                     self.guarded(lambda: self.show_forward(account, tag[1], result))
+                elif isinstance(tag, tuple) and tag[0] == 'broadcast_groups':
+                    self.footer.setText('Список чатов обновлён')
+                elif isinstance(tag, tuple) and tag[0].startswith('post_import_'):
+                    self.footer.setText('Пост сохранён' if tag[0] == 'post_import_commit' else 'Данные для импорта загружены')
                 elif tag == 'lookup':
                     preview = {'kind': 'collect', 'chat': 0, 'candidates': [result], 'excluded': 0}
                     self.guarded(lambda: self.show_preview(account, preview, 1, []))

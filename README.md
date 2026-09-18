@@ -24,7 +24,9 @@
 
 Windows desktop application for managing MAX accounts, collection jobs and reports.
 
-Current release: MAX Workspace 1.8 (Qt / Windows). Phone and QR login, account
+Current release: MAX Workspace 1.10 (Qt / Windows). Import chat posts with text,
+formatting, hyperlinks, photos and MP4 video into the saved-post library. Saved rich-text/photo posts,
+scheduled broadcasts with delivery reports, phone and QR login, account
 status badges, contact collection, invitations, reports and a shared chat catalog.
 
 **Перенос на ноутбук и восстановление сессий: [TRANSFER.md](TRANSFER.md).**
@@ -33,6 +35,23 @@ transfer archive before launching the application for the first time.
 Never upload account data, transfer archives or recovery keys to this repository.
 
 ## Run From Source
+
+### Обновить на другом ПК
+
+В существующей копии репозитория, после обычного закрытия MAX Workspace:
+
+```powershell
+git pull --ff-only origin main
+powershell -ExecutionPolicy Bypass -File .\setup-workspace.ps1
+powershell -ExecutionPolicy Bypass -File .\build-workspace.ps1
+powershell -ExecutionPolicy Bypass -File .\install-workspace.ps1
+```
+
+Если Git сообщает о локальных изменениях, сохраните их перед обновлением;
+не используйте принудительный сброс. На новом ПК сначала клонируйте репозиторий.
+Git переносит только код: аккаунты, сохранённые посты и задания переносятся
+отдельным зашифрованным архивом по `TRANSFER.md`. Существующие данные установщик
+не заменяет. Не запускайте одну и ту же рассылку одновременно на двух ПК.
 
 Requires Windows and Python 3.13. In PowerShell:
 
@@ -45,7 +64,7 @@ py -3.13 -m venv .venv
 Test the current application:
 
 ```powershell
-.venv\Scripts\python.exe -m unittest test_transfer_workspace test_workspace_status test_workspace_auth test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_workflows
+.venv\Scripts\python.exe -m unittest test_transfer_workspace test_workspace_status test_workspace_auth test_chat_catalog test_workspace_links test_workspace test_workspace_ui test_workspace_posts test_post_import test_workflows
 ```
 
 Build with `build-workspace.ps1`, then install with `install-workspace.ps1`.

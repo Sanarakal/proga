@@ -5,13 +5,15 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from workspace_posts import PostStore
 
 
-class Store:
+class Store(PostStore):
     def __init__(self, directory):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / 'workspace.sqlite'
+        self.init_posts()
         with self.db() as db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, name TEXT NOT NULL,
